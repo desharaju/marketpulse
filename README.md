@@ -56,6 +56,8 @@ uvicorn app.main:app --app-dir backend --reload
 | `REPORT_RECIPIENT` | Optional initial recipient; configurable through the settings API. |
 | `DASHBOARD_URL` | Link included in reports. |
 | `CORS_ORIGINS` | Allowed browser origins, comma-separated. |
+| `API_INTERNAL_URL` | Server-side API origin used by Next.js rewrites; Compose uses `http://api:8000`. |
+| `NEXT_PUBLIC_API_URL` | Optional direct browser API origin. Leave empty to use the same-origin Next.js proxy. |
 | `REFRESH_SECONDS` | Dashboard refresh interval. |
 | `REPORT_TIME` | Daily report time in `HH:MM` America/New_York; defaults to `08:00`. |
 

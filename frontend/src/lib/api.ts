@@ -1,4 +1,4 @@
-export const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+export const API_URL = process.env.NEXT_PUBLIC_API_URL || "";
 
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const adminKey = typeof window === "undefined" ? "" : window.sessionStorage.getItem("marketpulse-admin-key") || "";
