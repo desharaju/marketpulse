@@ -1,6 +1,6 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
-from typing import Protocol
+from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -23,6 +23,8 @@ class MarketDataProvider(Protocol):
     name: str
     mode: str
 
+    async def fetch_symbols(self, limit: int) -> list[str]: ...
+
     async def fetch_stocks(self, symbols: list[str]) -> dict: ...
 
     async def fetch_news(self, symbol: str) -> list[dict]: ...
@@ -31,6 +33,12 @@ class MarketDataProvider(Protocol):
 class DemoProvider:
     name = "Illustrative fixtures"
     mode = "demo"
+
+    def __init__(self, symbols: list[str]):
+        self.symbols = symbols
+
+    async def fetch_symbols(self, limit: int) -> list[str]:
+        return self.symbols[:limit]
 
     async def fetch_stocks(self, symbols: list[str]) -> dict:
         rows = [dict(row) for row in FIXTURES if row["symbol"] in symbols]
@@ -85,12 +93,32 @@ class FinnhubProvider:
         self._cached_at: datetime | None = None
         self._cached_symbols: tuple[str, ...] = ()
         self._cached_result: dict | None = None
+        self._directory_cached_at: datetime | None = None
+        self._directory_symbols: list[str] = []
 
-    async def _get(self, client: httpx.AsyncClient, path: str, params: dict) -> dict:
+    async def _get(self, client: httpx.AsyncClient, path: str, params: dict) -> Any:
         async with self._semaphore:
             response = await client.get(f"{self.base_url}/{path}", params={**params, "token": self.api_key})
             response.raise_for_status()
             return response.json()
+
+    async def fetch_symbols(self, limit: int) -> list[str]:
+        limit = min(max(limit, 0), 30)
+        now = datetime.now(UTC)
+        if not self._directory_symbols or not self._directory_cached_at or now - self._directory_cached_at >= timedelta(hours=24):
+            async with httpx.AsyncClient(timeout=self.timeout_seconds, follow_redirects=True) as client:
+                records = await self._get(client, "stock/symbol", {"exchange": "US"})
+            if not isinstance(records, list):
+                raise ValueError("Finnhub symbol directory response is invalid")
+            symbols = list(dict.fromkeys(
+                symbol
+                for row in records
+                if isinstance(row, dict)
+                if (symbol := str(row.get("displaySymbol") or row.get("symbol") or "").strip().upper())
+            ))
+            self._directory_symbols = symbols
+            self._directory_cached_at = now
+        return self._directory_symbols[:limit]
 
     async def fetch_stocks(self, symbols: list[str]) -> dict:
         now = datetime.now(UTC)
@@ -99,25 +127,81 @@ class FinnhubProvider:
             return {**self._cached_result, "cacheStatus": "cached"}
 
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-            async def fetch_symbol(symbol: str) -> dict:
+            async def fetch_quote(symbol: str) -> dict | Exception:
                 try:
-                    quote, candles = await asyncio.gather(
-                        self._get(client, "quote", {"symbol": symbol}),
-                        self._get(client, "stock/candle", {
-                            "symbol": symbol,
-                            "resolution": "5",
-                            "from": int((now - timedelta(days=35)).timestamp()),
-                            "to": int(now.timestamp()),
-                        }),
-                    )
-                    return self._normalize(symbol, quote, candles, now)
+                    result = await self._get(client, "quote", {"symbol": symbol})
+                    if not isinstance(result, dict):
+                        raise ValueError("Quote response is invalid")
+                    return result
                 except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
-                    return {"symbol": symbol, "error": self._safe_error(exc)}
+                    return exc
 
-            results = await asyncio.gather(*(fetch_symbol(symbol) for symbol in symbols))
+            quote_results = await asyncio.gather(*(fetch_quote(symbol) for symbol in symbols))
+            quotes = {
+                symbol: result
+                for symbol, result in zip(symbols, quote_results)
+                if not isinstance(result, Exception)
+            }
+            quote_errors = [
+                {"symbol": symbol, "message": self._safe_error(result)}
+                for symbol, result in zip(symbols, quote_results)
+                if isinstance(result, Exception)
+            ]
 
-        items = [item for item in results if "error" not in item]
-        errors = [{"symbol": item["symbol"], "message": item["error"]} for item in results if "error" in item]
+            candle_data: dict[str, dict] = {}
+            candle_error = None
+            candle_symbols = [symbol for symbol, quote in quotes.items() if quote.get("c") and quote.get("c") > 0]
+            if candle_symbols:
+                first_symbol = candle_symbols[0]
+                candle_params = {
+                    "symbol": first_symbol,
+                    "resolution": "5",
+                    "from": int((now - timedelta(days=35)).timestamp()),
+                    "to": int(now.timestamp()),
+                }
+                try:
+                    first_candles = await self._get(client, "stock/candle", candle_params)
+                    if not isinstance(first_candles, dict) or first_candles.get("s") not in {"ok", "no_data"}:
+                        raise ValueError("Intraday candles unavailable")
+                    candle_data[first_symbol] = first_candles
+
+                    async def fetch_candles(symbol: str) -> dict:
+                        return await self._get(client, "stock/candle", {
+                            **candle_params,
+                            "symbol": symbol,
+                        })
+
+                    other_symbols = candle_symbols[1:]
+                    other_results = await asyncio.gather(
+                        *(fetch_candles(symbol) for symbol in other_symbols),
+                        return_exceptions=True,
+                    )
+                    for symbol, result in zip(other_symbols, other_results):
+                        if isinstance(result, asyncio.CancelledError):
+                            raise result
+                        if isinstance(result, Exception):
+                            candle_error = candle_error or self._safe_error(result)
+                        elif isinstance(result, dict) and result.get("s") in {"ok", "no_data"}:
+                            candle_data[symbol] = result
+                        else:
+                            candle_error = candle_error or "Intraday candles unavailable"
+                except asyncio.CancelledError:
+                    raise
+                except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+                    candle_error = self._safe_error(exc)
+
+        items = []
+        for symbol, quote in quotes.items():
+            try:
+                item = self._normalize(symbol, quote, candle_data.get(symbol), now)
+                if not candle_data.get(symbol):
+                    item["volumeUnavailableReason"] = f"Intraday volume unavailable: {candle_error or 'Intraday candles unavailable'}"
+                items.append(item)
+            except (ValueError, KeyError, TypeError) as exc:
+                quote_errors.append({"symbol": symbol, "message": self._safe_error(exc)})
+
+        errors = quote_errors
+        volume_unavailable = any(item.get("volumeUnavailableReason") for item in items)
         updated = max((item["asOf"] for item in items if item.get("asOf")), default=None)
         snapshot = {
             "mode": self.mode,
@@ -128,8 +212,8 @@ class FinnhubProvider:
             "limitations": [
                 "Quote delay and exchange coverage depend on your Finnhub plan and exchange entitlements.",
                 "Premarket trade data is not provided by this scanner adapter.",
-                "Only the configured symbol universe is scanned.",
-            ],
+                "The first 30 symbols returned by Finnhub's US symbol directory are scanned; this is not the full market.",
+            ] + (["Finnhub intraday candles are unavailable for this account; quote prices are shown without volume-derived fields."] if volume_unavailable else []),
             "errors": errors,
             "items": items,
         }
@@ -140,24 +224,24 @@ class FinnhubProvider:
         return snapshot
 
     @staticmethod
-    def _safe_error(error: Exception) -> str:
+    def _safe_error(error: BaseException) -> str:
         if isinstance(error, httpx.HTTPStatusError):
             return f"Provider returned HTTP {error.response.status_code}"
         if isinstance(error, httpx.TimeoutException):
             return "Provider request timed out"
         if isinstance(error, httpx.RequestError):
             return "Provider request failed"
+        if isinstance(error, ValueError) and str(error) == "Quote unavailable":
+            return str(error)
         return "Provider response could not be normalized"
 
     @staticmethod
-    def _normalize(symbol: str, quote: dict, candles: dict, now: datetime) -> dict:
+    def _normalize(symbol: str, quote: dict, candles: dict | None, now: datetime) -> dict:
         if quote.get("c") is None or quote.get("c", 0) <= 0:
             raise ValueError("Quote unavailable")
-        if candles.get("s") not in {"ok", "no_data"}:
-            raise ValueError("Intraday candles unavailable")
 
         bars = []
-        for stamp, volume in zip(candles.get("t", []), candles.get("v", [])):
+        for stamp, volume in zip((candles or {}).get("t", []), (candles or {}).get("v", [])):
             timestamp = datetime.fromtimestamp(stamp, UTC).astimezone(NEW_YORK)
             if timestamp.time() >= datetime.strptime("09:30", "%H:%M").time() and timestamp.time() < datetime.strptime("16:00", "%H:%M").time():
                 bars.append({"timestamp": timestamp, "volume": max(0, float(volume or 0))})
@@ -195,6 +279,7 @@ class FinnhubProvider:
             "asOf": quote_time.isoformat() if quote_time else now.isoformat(),
             "simulated": False,
             "dataQuality": "provider; subscription-dependent delay",
+            "volumeUnavailableReason": None,
         }
 
     async def fetch_news(self, symbol: str) -> list[dict]:
@@ -245,4 +330,4 @@ class FinnhubProvider:
 def create_provider(settings: Settings) -> MarketDataProvider:
     if settings.finnhub_api_key:
         return FinnhubProvider(settings.finnhub_api_key)
-    return DemoProvider()
+    return DemoProvider(settings.symbols)

@@ -17,7 +17,8 @@ class Scanner:
         if not force and self._snapshot and monotonic() - self._snapshot_at < min(self.settings.refresh_seconds, 60):
             return {**self._snapshot, "marketSession": market_session(), "cacheStatus": "cached"}
         try:
-            snapshot = await self.provider.fetch_stocks(self.settings.symbols)
+            symbols = await self.provider.fetch_symbols(limit=30)
+            snapshot = await self.provider.fetch_stocks(symbols)
         except Exception:
             snapshot = {
                 "mode": self.provider.mode,
