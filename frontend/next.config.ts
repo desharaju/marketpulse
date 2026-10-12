@@ -3,7 +3,10 @@ import type { NextConfig } from "next";
 const nextConfig: NextConfig = {
   output: "standalone",
   async rewrites() {
-    const apiOrigin = process.env.API_INTERNAL_URL || "http://localhost:8000";
+    const configuredApiOrigin = process.env.API_INTERNAL_URL || "http://localhost:8000";
+    const apiOrigin = /^https?:\/\//.test(configuredApiOrigin)
+      ? configuredApiOrigin
+      : `https://${configuredApiOrigin}`;
     return [
       { source: "/api/:path*", destination: `${apiOrigin}/api/:path*` },
       { source: "/docs", destination: `${apiOrigin}/docs` },

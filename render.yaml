@@ -1,0 +1,54 @@
+databases:
+  - name: marketpulse-db
+    databaseName: marketpulse
+    user: marketpulse
+    plan: free
+    region: oregon
+    postgresMajorVersion: "16"
+
+services:
+  - type: web
+    name: marketpulse-api
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerContext: .
+    dockerfilePath: ./backend/Dockerfile
+    healthCheckPath: /api/health
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: PORT
+        value: "10000"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: marketpulse-db
+          property: connectionString
+      - key: FINNHUB_API_KEY
+        sync: false
+      - key: ADMIN_API_KEY
+        generateValue: true
+      - key: CORS_ORIGINS
+        value: "*"
+      - key: MARKET_SYMBOLS
+        value: AAPL,MSFT,NVDA,AMZN,TSLA,META,AMD,PLTR,SMCI,COIN
+      - key: REFRESH_SECONDS
+        value: "60"
+      - key: DASHBOARD_URL
+        value: https://marketpulse-dashboard.onrender.com
+      - key: REPORT_TIME
+        value: "08:00"
+
+  - type: web
+    name: marketpulse-dashboard
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerContext: .
+    dockerfilePath: ./frontend/Dockerfile
+    envVars:
+      - key: API_INTERNAL_URL
+        fromService:
+          type: web
+          name: marketpulse-api
+          property: host

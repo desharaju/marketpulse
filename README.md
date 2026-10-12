@@ -44,6 +44,12 @@ pip install -r backend\requirements.txt
 uvicorn app.main:app --app-dir backend --reload
 ```
 
+## Deploy on Render
+
+The root `render.yaml` Blueprint creates the FastAPI service, Next.js dashboard, and PostgreSQL database in Oregon. Push the repository to GitHub, then in Render choose **New > Blueprint**, connect `desharaju/marketpulse`, and apply the Blueprint. Enter your Finnhub key when prompted; the admin key is generated automatically and must be kept secret. The dashboard uses the API service URL through a server-side proxy, so the Finnhub key is never sent to the browser.
+
+The Blueprint uses Render's free plans. Free web services spin down after 15 minutes without traffic, so the first request after idle can take about a minute. Free Render Postgres databases expire 30 days after creation; upgrade or migrate the database before then to retain application data. Free services also cannot send SMTP over ports 25, 465, or 587, so configure a paid service or a supported email delivery provider if scheduled email reports are needed. Review Render's current [free instance limits](https://render.com/docs/free) before deployment.
+
 ## Configuration
 
 | Variable | Purpose |
